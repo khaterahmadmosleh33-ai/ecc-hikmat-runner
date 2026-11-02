@@ -3,15 +3,17 @@
 An authenticated single-owner command runner for a dedicated Render Free Web Service.
 No API keys, login tokens, user files, or account details belong in this repository.
 
-Current status: source prepared; not deployed or connected. Local syntax checks pass.
-The development container maps only UID 0, so privilege-separation integration tests
-must run in the Docker build before deployment can succeed. Live execution is unverified.
+The Docker build runs real integration tests for Node/Python execution, secret
+separation, no-new-privileges, file safety, HTTP authentication, stable request IDs,
+process cleanup, output limits, command timeout and session cleanup. Local syntax
+checks alone do not establish runtime compatibility. A development environment
+that maps only UID 0 skips those tests; use the Docker build to execute them.
 
 Set `ECC_RUNNER_SECRET` to a random secret of at least 40 characters at runtime.
 Deploy this directory as a Docker web service, plan `free`, with `/health` as its health endpoint.
 The companion owner-private ChatGPT Site authenticates the user and stores results and text files.
 
-Commands run as UID 10001 with a clean environment, no new privileges, bounded CPU, address space,
+Commands run as the configured non-root UID (default 10001) with a clean environment, no new privileges, bounded CPU, address space,
 process count, file size, elapsed time and output. The HTTP coordinator retains the runtime secret.
 Set `ECC_GUEST_UID` to a dedicated non-root UID in 10000–65533 on shared hosts;
 the default 10001 is intended for isolated builds. This avoids host-wide per-UID

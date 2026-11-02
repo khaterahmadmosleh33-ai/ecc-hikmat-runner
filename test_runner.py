@@ -66,6 +66,8 @@ class RunnerTests(unittest.TestCase):
         time.sleep(.1)
         state = Path('/proc') / str(pid) / 'stat'
         self.assertTrue(not state.exists() or state.read_text().split()[2] == 'Z')
+        r = self.call('exec', command='sleep 60')
+        self.assertEqual(r['outcome'], 'timeout')
 
     def test_stop_and_restart_detection(self):
         self.assertEqual(self.call('stop')['outcome'], 'stopped')
@@ -93,6 +95,7 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(HTTPError) as e:
                 request('/v1/start', a, 'wrong')
             self.assertEqual(e.exception.code, 401)
+            self.assertEqual(request('/v1/probe', {})['kind'], 'owner-trusted-code-container')
             first = request('/v1/start', a)
             self.assertEqual(first, request('/v1/start', a))
             b = {'request_id': str(uuid.uuid4()), 'session_id': a['session_id'], 'command': 'echo ran >> count; cat count'}

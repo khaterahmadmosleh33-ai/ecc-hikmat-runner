@@ -70,6 +70,18 @@ def kill_guests():
             pass
 
 
+def reap_orphans():
+    # Called only after the serialized foreground child was already waited for.
+    deadline = time.monotonic() + .5
+    while time.monotonic() < deadline:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if not pid:
+                time.sleep(.01)
+        except ChildProcessError:
+            break
+
+
 def session(value):
     sid = identifier(value)
     s = SESSIONS.get(sid)
@@ -149,6 +161,7 @@ def execute(base, command):
     finally:
         kill_guests()
         proc.wait(timeout=3)
+        reap_orphans()
         sel.close()
         proc.stdout.close()
         proc.stderr.close()
@@ -203,6 +216,7 @@ def dispatch(path, a):
             raise Problem('File is missing, unsafe, or not UTF-8.', 400)
     if path == '/v1/stop':
         kill_guests()
+        reap_orphans()
         shutil.rmtree(base)
         del SESSIONS[sid]
         return {'outcome': 'stopped', 'boot_id': BOOT}
@@ -250,6 +264,9 @@ class Handler(BaseHTTPRequestHandler):
             acquired = LOCK.acquire(blocking=False)
             if not acquired:
                 raise Problem('An operation is in progress. Inspect the existing request.', 409)
+            if self.path == '/v1/probe':
+                return self.reply({'ok': True, 'version': VERSION, 'boot_id': BOOT,
+                                   'kind': 'owner-trusted-code-container'})
             if self.path in ('/v1/session', '/v1/result'):
                 if self.path == '/v1/result':
                     item = RESULTS.get(identifier(a.get('request_id')))
@@ -285,6 +302,8 @@ if __name__ == '__main__':
         os.execv('/bin/bash', ['/bin/bash', '-c', sys.argv[2]])
     if os.getuid() != 0 or len(KEY) < 40:
         raise SystemExit('Run as container coordinator root with an ECC_RUNNER_SECRET of at least 40 characters.')
+    if ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) != 0:
+        raise SystemExit('The coordinator requires Linux child-subreaper support.')
     ROOT.mkdir(mode=0o711, parents=True, exist_ok=True)
     os.chmod(ROOT, 0o711)
     ThreadingHTTPServer(('0.0.0.0', int(os.environ.get('PORT', '10000'))), Handler).serve_forever()

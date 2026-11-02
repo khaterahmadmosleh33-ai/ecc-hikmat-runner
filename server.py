@@ -60,16 +60,25 @@ def guest_limits():
     os.setuid(GUEST)
 
 
-def kill_guests():
+def kill_guests_direct():
     # Kill detached grandchildren too; all guest operations are serialized.
     for entry in Path('/proc').iterdir():
-        if not entry.name.isdigit():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
             continue
         try:
             if entry.stat().st_uid == GUEST:
                 os.kill(int(entry.name), signal.SIGKILL)
         except (ProcessLookupError, FileNotFoundError, PermissionError):
             pass
+
+
+def kill_guests():
+    # Managed hosts may remove CAP_KILL from coordinator root. A short-lived
+    # helper drops to the dedicated guest UID and signals its own UID's tasks.
+    subprocess.run([sys.executable, str(Path(__file__).resolve()), '--cleanup'],
+                   env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'ECC_GUEST_UID': str(GUEST)},
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=5, check=True)
 
 
 def reap_orphans():
@@ -170,10 +179,13 @@ def execute(base, command, job):
         if proc is not None:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             if proc.poll() is None:
-                proc.kill()
+                try:
+                    proc.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
         kill_guests()
         if proc is not None:
             proc.wait(timeout=5)
@@ -338,6 +350,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 2 and sys.argv[1] == '--cleanup':
+        os.setsid()
+        if ctypes.CDLL(None).prctl(38, 1, 0, 0, 0) != 0:
+            os._exit(126)
+        os.setgroups([])
+        os.setgid(GUEST)
+        os.setuid(GUEST)
+        kill_guests_direct()
+        sys.exit(0)
     if len(sys.argv) == 3 and sys.argv[1] == '--guest':
         guest_limits()
         os.execv('/bin/bash', ['/bin/bash', '-c', sys.argv[2]])

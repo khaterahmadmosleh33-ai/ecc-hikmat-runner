@@ -13,6 +13,9 @@ The companion owner-private ChatGPT Site authenticates the user and stores resul
 
 Commands run as UID 10001 with a clean environment, no new privileges, bounded CPU, address space,
 process count, file size, elapsed time and output. The HTTP coordinator retains the runtime secret.
+Set `ECC_GUEST_UID` to a dedicated non-root UID in 10000–65533 on shared hosts;
+the default 10001 is intended for isolated builds. This avoids host-wide per-UID
+process-count contention while retaining the process limit.
 Execution is limited to one operation at a time. Only run code trusted by the account owner: this
 shared Linux container is **not** a VM sandbox and outbound network access is enabled.
 

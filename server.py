@@ -21,7 +21,9 @@ VERSION = '1.2.0'
 KEY = os.environ.get('ECC_RUNNER_SECRET', '')
 BOOT = str(uuid.uuid4())
 ROOT = Path(os.environ.get('ECC_RUNNER_ROOT', '/var/lib/ecc'))
-GUEST = 10001
+GUEST = int(os.environ.get('ECC_GUEST_UID', '10001'))
+if not 10000 <= GUEST < 65534:
+    raise SystemExit('ECC_GUEST_UID must be an unprivileged UID from 10000 to 65533.')
 MAX_FILE = 98304
 MAX_OUTPUT = 65536
 LOCK = threading.Lock()
@@ -127,7 +129,8 @@ def execute(base, command):
         raise Problem('Command must have 1–12000 characters.')
     proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--guest', command], cwd=base,
         env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(base), 'LANG': 'C.UTF-8',
-             'TMPDIR': str(base), 'NODE_OPTIONS': '--max-old-space-size=128'},
+             'TMPDIR': str(base), 'NODE_OPTIONS': '--max-old-space-size=128',
+             'ECC_GUEST_UID': str(GUEST)},
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     sel = selectors.DefaultSelector()
     output = {'stdout': bytearray(), 'stderr': bytearray()}

@@ -81,6 +81,7 @@ class RunnerTests(unittest.TestCase):
         key = 'a' * 48
         proc = subprocess.Popen(['python3', str(Path(__file__).with_name('server.py'))],
             env={**os.environ, 'ECC_RUNNER_SECRET': key, 'PORT': '18767',
+                 'ECC_GUEST_UID': '54329',
                  'ECC_RUNNER_ROOT': str(m.ROOT / 'http')}, stdout=subprocess.DEVNULL)
         def request(path, data, auth=key):
             req = Request('http://127.0.0.1:18767' + path, json.dumps(data).encode(),
@@ -105,6 +106,8 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(first['stdout'], 'ran\n')
             self.assertEqual(first, request('/v1/exec', b))
             self.assertEqual(request('/v1/result', {'request_id': b['request_id']}), first)
+            uid_check = request('/v1/exec', {'request_id': str(uuid.uuid4()), 'session_id': a['session_id'], 'command': 'id -u'})
+            self.assertEqual(uid_check['stdout'].strip(), '54329')
             with self.assertRaises(HTTPError) as e:
                 request('/v1/exec', {**b, 'command': 'echo different'})
             self.assertEqual(e.exception.code, 409)

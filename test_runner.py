@@ -31,14 +31,16 @@ class RunnerTests(unittest.TestCase):
         m.kill_guests()
         self.tmp.cleanup()
 
-    def call(self, path, **data):
-        return m.dispatch('/v1/' + path, {'session_id': self.sid, **data})
+    def call(self, endpoint, **data):
+        return m.dispatch('/v1/' + endpoint, {'session_id': self.sid, **data})
 
     def test_execution_and_secret_separation(self):
         os.environ['ECC_RUNNER_SECRET'] = 'never-pass-this-to-guest'
         r = self.call('exec', command="python3 -c 'import os; print(os.getuid()); print(os.environ.get(\"ECC_RUNNER_SECRET\", \"absent\"))'")
         self.assertEqual(r['exit_code'], 0)
         self.assertEqual(r['stdout'], '10001\nabsent\n')
+        r = self.call('exec', command='awk \'$1 == "NoNewPrivs:" { print $2 }\' /proc/self/status')
+        self.assertEqual(r['stdout'].strip(), '1')
         r = self.call('exec', command='node -p "6 * 7"')
         self.assertEqual(r['exit_code'], 0, r)
         self.assertEqual(r['stdout'].strip(), '42')

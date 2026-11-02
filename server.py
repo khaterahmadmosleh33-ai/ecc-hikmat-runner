@@ -165,9 +165,19 @@ def execute(base, command, job):
     except Exception:
         outcome = 'failed'
     finally:
+        # Cancellation may arrive before the helper has dropped privileges.
+        # Always kill the exact child/group as well as detached guest descendants.
+        if proc is not None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if proc.poll() is None:
+                proc.kill()
         kill_guests()
         if proc is not None:
             proc.wait(timeout=5)
+            kill_guests()
             proc.stdout.close()
             proc.stderr.close()
         reap_orphans()

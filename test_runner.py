@@ -24,6 +24,8 @@ class RunnerTests(unittest.TestCase):
         m.ROOT = Path(self.tmp.name)
         m.ROOT.chmod(0o711)
         m.SESSIONS.clear()
+        m.JOBS.clear()
+        m.RESULTS.clear()
         self.sid = str(uuid.uuid4())
         m.dispatch('/v1/start', {'session_id': self.sid})
 
@@ -32,7 +34,22 @@ class RunnerTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def call(self, endpoint, **data):
-        return m.dispatch('/v1/' + endpoint, {'session_id': self.sid, **data})
+        a = {'session_id': self.sid, 'request_id': str(uuid.uuid4()), **data}
+        with m.LOCK:
+            r = m.dispatch('/v1/' + endpoint, a)
+        if endpoint == 'exec':
+            return self.wait_job(r['job_id'])
+        return r
+
+    def wait_job(self, jid):
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            with m.LOCK:
+                r = m.job_view(m.JOBS[jid])
+            if r['outcome'] != 'running':
+                return r
+            time.sleep(.03)
+        self.fail('Background job did not finish.')
 
     def test_execution_and_secret_separation(self):
         os.environ['ECC_RUNNER_SECRET'] = 'never-pass-this-to-guest'
@@ -61,15 +78,37 @@ class RunnerTests(unittest.TestCase):
 
     def test_output_and_detached_process_cleanup(self):
         r = self.call('exec', command="python3 -c 'print(\"x\" * 100000)' ")
-        self.assertEqual(r['outcome'], 'output_limit')
+        self.assertEqual(r['outcome'], 'complete')
+        self.assertTrue(r['output_truncated'])
         self.assertLessEqual(len(r['stdout'].encode()) + len(r['stderr'].encode()), m.MAX_OUTPUT)
         r = self.call('exec', command='setsid sleep 120 >/dev/null 2>&1 & echo $!')
         pid = int(r['stdout'])
         time.sleep(.1)
         state = Path('/proc') / str(pid) / 'stat'
         self.assertTrue(not state.exists() or state.read_text().split()[2] == 'Z')
-        r = self.call('exec', command='sleep 60')
+        r = self.call('exec', command='sleep 60', timeout_seconds=.2)
         self.assertEqual(r['outcome'], 'timeout')
+
+    def test_async_status_cancel_and_no_expiry(self):
+        # Old absolute-expiry values no longer expire active workspaces.
+        m.SESSIONS[self.sid]['expires'] = 1
+        self.assertEqual(self.call('session')['session']['id'], self.sid)
+        with m.LOCK:
+            r = m.dispatch('/v1/exec', {'session_id': self.sid, 'request_id': str(uuid.uuid4()),
+                                      'command': 'echo ready; sleep 90'})
+        self.assertEqual(r['outcome'], 'running')
+        jid = r['job_id']
+        self.assertEqual(self.call('job', job_id=jid)['outcome'], 'running')
+        self.call('cancel', job_id=jid)
+        self.assertEqual(self.wait_job(jid)['outcome'], 'cancelled')
+        self.assertEqual(self.call('session')['session']['id'], self.sid)
+        # A complete session stop also cancels work, then removes its directory.
+        with m.LOCK:
+            r = m.dispatch('/v1/exec', {'session_id': self.sid, 'request_id': str(uuid.uuid4()), 'command': 'sleep 90'})
+        self.assertEqual(self.call('stop')['outcome'], 'stopping')
+        self.assertEqual(self.wait_job(r['job_id'])['outcome'], 'cancelled')
+        self.assertNotIn(self.sid, m.SESSIONS)
+        self.assertFalse((m.ROOT / self.sid).exists())
 
     def test_stop_and_restart_detection(self):
         self.assertEqual(self.call('stop')['outcome'], 'stopped')
@@ -103,11 +142,31 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(first, request('/v1/start', a))
             b = {'request_id': str(uuid.uuid4()), 'session_id': a['session_id'], 'command': 'echo ran >> count; cat count'}
             first = request('/v1/exec', b)
-            self.assertEqual(first['stdout'], 'ran\n')
+            self.assertEqual(first['outcome'], 'running')
+            def wait_remote(jid):
+                for _ in range(300):
+                    value = request('/v1/result', {'request_id': jid})
+                    if value['outcome'] != 'running':
+                        return value
+                    time.sleep(.03)
+                self.fail('HTTP job did not finish')
+            completed = wait_remote(b['request_id'])
+            self.assertEqual(completed['stdout'], 'ran\n')
             self.assertEqual(first, request('/v1/exec', b))
-            self.assertEqual(request('/v1/result', {'request_id': b['request_id']}), first)
+            self.assertEqual(request('/v1/result', {'request_id': b['request_id']}), completed)
             uid_check = request('/v1/exec', {'request_id': str(uuid.uuid4()), 'session_id': a['session_id'], 'command': 'id -u'})
-            self.assertEqual(uid_check['stdout'].strip(), '54329')
+            self.assertEqual(wait_remote(uid_check['job_id'])['stdout'].strip(), '54329')
+            long_job = request('/v1/exec', {'request_id': str(uuid.uuid4()), 'session_id': a['session_id'], 'command': 'echo begin; sleep 16; echo finished'})
+            self.assertEqual(long_job['outcome'], 'running')
+            self.assertIsNone(long_job['timeout_seconds'])
+            for _ in range(650):
+                completed_long = request('/v1/job', {'session_id': a['session_id'], 'job_id': long_job['job_id']})
+                if completed_long['outcome'] != 'running':
+                    break
+                time.sleep(.03)
+            self.assertEqual(completed_long['outcome'], 'complete')
+            self.assertIn('finished', completed_long['stdout'])
+            self.assertIsNone(request('/v1/session', {'session_id': a['session_id']})['session']['expires'])
             with self.assertRaises(HTTPError) as e:
                 request('/v1/exec', {**b, 'command': 'echo different'})
             self.assertEqual(e.exception.code, 409)

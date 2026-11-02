@@ -17,7 +17,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 KEY = os.environ.get('ECC_RUNNER_SECRET', '')
 BOOT = str(uuid.uuid4())
 ROOT = Path(os.environ.get('ECC_RUNNER_ROOT', '/var/lib/ecc'))
@@ -26,7 +26,8 @@ if not 10000 <= GUEST < 65534:
     raise SystemExit('ECC_GUEST_UID must be an unprivileged UID from 10000 to 65533.')
 MAX_FILE = 98304
 MAX_OUTPUT = 65536
-LOCK = threading.Lock()
+LOCK = threading.RLock()
+JOBS = {}
 SESSIONS = {}
 RESULTS = {}
 
@@ -46,7 +47,6 @@ def identifier(value):
 
 def guest_limits():
     os.setsid()
-    resource.setrlimit(resource.RLIMIT_CPU, (15, 16))
     # V8 reserves a large virtual address cage; JS heap is capped separately.
     resource.setrlimit(resource.RLIMIT_AS, (16 * 1024**3, 16 * 1024**3))
     resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024**2, 16 * 1024**2))
@@ -87,8 +87,8 @@ def reap_orphans():
 def session(value):
     sid = identifier(value)
     s = SESSIONS.get(sid)
-    if not s or s['expires'] < time.time():
-        raise Problem('Session expired or service restarted. Start a new session; restore saved files.', 409)
+    if not s or s.get('closing'):
+        raise Problem('Session closed or service restarted. Start a new session; restore saved files.', 409)
     return sid, ROOT / sid
 
 
@@ -124,64 +124,82 @@ def safe_file(base, path, create=False):
         os.close(fd)
 
 
-def execute(base, command):
-    if not isinstance(command, str) or not command.strip() or len(command) > 12000:
-        raise Problem('Command must have 1–12000 characters.')
-    proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--guest', command], cwd=base,
-        env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(base), 'LANG': 'C.UTF-8',
-             'TMPDIR': str(base), 'NODE_OPTIONS': '--max-old-space-size=128',
-             'ECC_GUEST_UID': str(GUEST)},
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def job_view(job):
+    return {k: v for k, v in job.items() if k not in ('cancel', 'thread')}
+
+
+def execute(base, command, job):
+    proc = None
     sel = selectors.DefaultSelector()
-    output = {'stdout': bytearray(), 'stderr': bytearray()}
-    for name in output:
-        stream = getattr(proc, name)
-        os.set_blocking(stream.fileno(), False)
-        sel.register(stream, selectors.EVENT_READ, name)
-    deadline = time.monotonic() + 15
+    started = time.monotonic()
     outcome = 'complete'
     try:
-        while sel.get_map():
-            if time.monotonic() >= deadline:
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--guest', command], cwd=base,
+            env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': str(base), 'LANG': 'C.UTF-8',
+                 'TMPDIR': str(base), 'NODE_OPTIONS': '--max-old-space-size=128', 'ECC_GUEST_UID': str(GUEST)},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        for name in ('stdout', 'stderr'):
+            stream = getattr(proc, name)
+            os.set_blocking(stream.fileno(), False)
+            sel.register(stream, selectors.EVENT_READ, name)
+        while sel.get_map() or proc.poll() is None:
+            if job['cancel'].is_set():
+                outcome = 'cancelled'
+                break
+            if job['timeout_seconds'] is not None and time.monotonic() - started >= job['timeout_seconds']:
                 outcome = 'timeout'
                 break
-            for key, _ in sel.select(min(.1, max(0, deadline - time.monotonic()))):
+            for key, _ in sel.select(.1):
                 chunk = os.read(key.fileobj.fileno(), 8192)
                 if not chunk:
                     sel.unregister(key.fileobj)
                     continue
-                output[key.data].extend(chunk)
-                if sum(map(len, output.values())) > MAX_OUTPUT:
-                    outcome = 'output_limit'
-                    break
-            if outcome != 'complete':
-                break
-        if outcome == 'complete':
-            try:
-                proc.wait(timeout=max(.01, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired:
-                outcome = 'timeout'
+                with LOCK:
+                    name = key.data
+                    value = job[name].encode('utf-8') + chunk
+                    if len(value) > MAX_OUTPUT // 2:
+                        job['output_truncated'] = True
+                    job[name] = value[-MAX_OUTPUT // 2:].decode('utf-8', errors='replace')
+            if not sel.get_map() and proc.poll() is None:
+                time.sleep(.05)
+    except Exception:
+        outcome = 'failed'
     finally:
         kill_guests()
-        proc.wait(timeout=3)
+        if proc is not None:
+            proc.wait(timeout=5)
+            proc.stdout.close()
+            proc.stderr.close()
         reap_orphans()
         sel.close()
-        proc.stdout.close()
-        proc.stderr.close()
-    remaining = MAX_OUTPUT
-    texts = {}
-    for name, raw in output.items():
-        texts[name] = raw[:remaining].decode('utf-8', errors='replace')
-        remaining = max(0, remaining - len(raw))
-    return {'outcome': outcome, 'exit_code': proc.returncode, **texts, 'boot_id': BOOT}
+        with LOCK:
+            job.update(outcome=outcome, exit_code=proc.returncode if proc else None, finished=time.time())
+            sid = job['session_id']
+            if SESSIONS.get(sid, {}).get('closing'):
+                shutil.rmtree(ROOT / sid, ignore_errors=True)
+                del SESSIONS[sid]
+
+
+def start_job(base, sid, a):
+    command = a.get('command')
+    if not isinstance(command, str) or not command.strip() or len(command) > 12000:
+        raise Problem('Command must have 1–12000 characters.')
+    timeout = a.get('timeout_seconds')
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 604800):
+        raise Problem('Optional timeout must be positive and at most seven days.')
+    if any(j['outcome'] == 'running' for j in JOBS.values()):
+        raise Problem('A job is running. Inspect or cancel it before starting another.', 409)
+    jid = identifier(a.get('request_id'))
+    job = dict(job_id=jid, session_id=sid, boot_id=BOOT, outcome='running', started=time.time(),
+               finished=None, exit_code=None, stdout='', stderr='', output_truncated=False,
+               timeout_seconds=timeout, cancel=threading.Event())
+    JOBS[jid] = job
+    job['thread'] = threading.Thread(target=execute, args=(base, command, job), daemon=True)
+    job['thread'].start()
+    return job_view(job)
 
 
 def dispatch(path, a):
-    now = time.time()
-    for sid, s in list(SESSIONS.items()):
-        if s['expires'] < now:
-            shutil.rmtree(ROOT / sid, ignore_errors=True)
-            del SESSIONS[sid]
     if path == '/v1/start':
         sid = identifier(a.get('session_id'))
         if sid not in SESSIONS:
@@ -190,13 +208,20 @@ def dispatch(path, a):
             base = ROOT / sid
             base.mkdir(mode=0o700)
             os.chown(base, GUEST, GUEST)
-            SESSIONS[sid] = {'id': sid, 'expires': now + 1800}
+            SESSIONS[sid] = {'id': sid, 'created': time.time(), 'expires': None}
         return {'outcome': 'started', 'session': SESSIONS[sid], 'boot_id': BOOT}
+    if path in ('/v1/job', '/v1/cancel'):
+        job = JOBS.get(identifier(a.get('job_id')))
+        if not job or job['session_id'] != identifier(a.get('session_id')):
+            raise Problem('Job missing or service restarted.', 409)
+        if path == '/v1/cancel' and job['outcome'] == 'running':
+            job['cancel'].set()
+        return job_view(job)
     sid, base = session(a.get('session_id'))
     if path == '/v1/session':
-        return {'session': SESSIONS[sid], 'boot_id': BOOT}
+        return {'session': SESSIONS[sid], 'jobs': [job_view(j) for j in JOBS.values() if j['session_id'] == sid], 'boot_id': BOOT}
     if path == '/v1/exec':
-        return execute(base, a.get('command'))
+        return start_job(base, sid, a)
     if path == '/v1/file':
         writing = a.get('action') == 'write'
         if a.get('action') not in ('read', 'write'):
@@ -218,8 +243,11 @@ def dispatch(path, a):
         except (OSError, UnicodeError):
             raise Problem('File is missing, unsafe, or not UTF-8.', 400)
     if path == '/v1/stop':
-        kill_guests()
-        reap_orphans()
+        active = next((j for j in JOBS.values() if j['session_id'] == sid and j['outcome'] == 'running'), None)
+        if active:
+            SESSIONS[sid]['closing'] = True
+            active['cancel'].set()
+            return {'outcome': 'stopping', 'job_id': active['job_id'], 'boot_id': BOOT}
         shutil.rmtree(base)
         del SESSIONS[sid]
         return {'outcome': 'stopped', 'boot_id': BOOT}
@@ -245,8 +273,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in ('/', '/health'):
             return self.reply({'error': 'Not found'}, 404)
         self.reply({'ok': True, 'version': VERSION, 'boot_id': BOOT,
-                    'kind': 'owner-trusted-code-container', 'max_command_seconds': 15,
-                    'session_seconds': 1800, 'network': 'outbound-enabled'})
+                    'kind': 'owner-trusted-code-container', 'max_command_seconds': None, 'async_jobs': True,
+                    'session_seconds': None, 'network': 'outbound-enabled'})
 
     def do_POST(self):
         acquired = False
@@ -270,10 +298,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == '/v1/probe':
                 return self.reply({'ok': True, 'version': VERSION, 'boot_id': BOOT,
                                    'kind': 'owner-trusted-code-container'})
-            if self.path in ('/v1/session', '/v1/result'):
+            if self.path in ('/v1/session', '/v1/result', '/v1/job'):
                 if self.path == '/v1/result':
                     item = RESULTS.get(identifier(a.get('request_id')))
-                    return self.reply(item['result'] if item else {'outcome': 'unknown', 'boot_id': BOOT})
+                    return self.reply(job_view(JOBS[a['request_id']]) if a['request_id'] in JOBS else item['result'] if item else {'outcome': 'unknown', 'boot_id': BOOT})
                 return self.reply(dispatch(self.path, a))
             rid = identifier(a.get('request_id'))
             digest = hashlib.sha256(self.path.encode() + raw).hexdigest()

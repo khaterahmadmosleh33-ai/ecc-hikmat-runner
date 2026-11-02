@@ -118,7 +118,9 @@ class RunnerTests(unittest.TestCase):
     def test_http_auth_and_idempotency(self):
         # Keep the HTTP API under test in a separate process.
         key = 'a' * 48
-        proc = subprocess.Popen(['python3', str(Path(__file__).with_name('server.py'))],
+        # Reproduce a managed host: coordinator root has no CAP_KILL.
+        restricted = 'import ctypes,os,sys; assert ctypes.CDLL(None).prctl(24,5,0,0,0)==0; os.execv(sys.executable,[sys.executable,sys.argv[1]])'
+        proc = subprocess.Popen(['python3', '-c', restricted, str(Path(__file__).with_name('server.py'))],
             env={**os.environ, 'ECC_RUNNER_SECRET': key, 'PORT': '18767',
                  'ECC_GUEST_UID': '54329',
                  'ECC_RUNNER_ROOT': str(m.ROOT / 'http')}, stdout=subprocess.DEVNULL)
@@ -167,6 +169,12 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(completed_long['outcome'], 'complete')
             self.assertIn('finished', completed_long['stdout'])
             self.assertIsNone(request('/v1/session', {'session_id': a['session_id']})['session']['expires'])
+            cancelling = request('/v1/exec', {'request_id': str(uuid.uuid4()), 'session_id': a['session_id'], 'command': 'echo cancelling; sleep 120'})
+            time.sleep(.1)  # The child has dropped UID, so root cannot signal it directly.
+            cancelled = request('/v1/cancel', {'request_id': str(uuid.uuid4()), 'session_id': a['session_id'], 'job_id': cancelling['job_id']})
+            self.assertEqual(cancelled['outcome'], 'running')
+            self.assertEqual(wait_remote(cancelling['job_id'])['outcome'], 'cancelled')
+            self.assertEqual(request('/v1/session', {'session_id': a['session_id']})['session']['id'], a['session_id'])
             with self.assertRaises(HTTPError) as e:
                 request('/v1/exec', {**b, 'command': 'echo different'})
             self.assertEqual(e.exception.code, 409)
